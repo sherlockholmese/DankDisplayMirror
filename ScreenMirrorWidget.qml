@@ -215,7 +215,8 @@ PluginComponent {
                     }
 
                     Column {
-                        width: parent.width - Theme.iconSizeLarge - refreshButton.width - parent.spacing * 2
+                        width: parent.width - Theme.iconSizeLarge - refreshButton.width
+                            - parent.spacing * 2
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: Theme.spacingXXS
 
