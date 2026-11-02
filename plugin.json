@@ -2,7 +2,7 @@
   "id": "dankDisplayMirror",
   "name": "Screen Mirroring",
   "description": "Route multiple Wayland display mirrors from the DankMaterialShell Control Center",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "author": "sherlockholmese",
   "type": "composite",
@@ -17,7 +17,7 @@
   "settings": "./ScreenMirrorSettings.qml",
   "startupCheck": "./StartupCheck.qml",
   "icon": "screen_share",
-  "requires_dms": ">=1.6.0",
+  "requires_dms": ">=2.0.0",
   "dependencies": [
     "wl-mirror",
     "dms"

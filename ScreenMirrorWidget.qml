@@ -1,8 +1,13 @@
 import QtQuick
 import qs.Common
 import qs.Services
+import qs.DCommon.Widgets
 import qs.Widgets
+import qs.Modules.ControlCenter
+import qs.Modules.ControlCenter.Widgets
 import qs.Modules.Plugins
+import "./components"
+import "./components/mirrorGeometry.js" as Geometry
 
 PluginComponent {
     id: root
@@ -11,6 +16,9 @@ PluginComponent {
     readonly property var activeMirrors: activeMirrorsVar.value || []
     readonly property var availableOutputs: outputsVar.value || []
     readonly property bool isMirroring: activeMirrors.length > 0
+    readonly property var failedRoute: failedRouteVar.value
+    readonly property var scalingModes: ["fit", "cover", "exact"]
+    readonly property string scaling: scalingModes.indexOf(pluginData.scaling) >= 0 ? pluginData.scaling : "fit"
 
     PluginGlobalVar {
         id: requestVar
@@ -48,6 +56,12 @@ PluginComponent {
         defaultValue: ""
     }
 
+    PluginGlobalVar {
+        id: failedRouteVar
+        varName: "failedRoute"
+        defaultValue: null
+    }
+
     function tr(text) {
         return I18n.trFor("dankDisplayMirror", text);
     }
@@ -62,8 +76,61 @@ PluginComponent {
         });
     }
 
+    function output(outputName) {
+        return availableOutputs.find(candidate => candidate.name === outputName) || null;
+    }
+
     function hasOutput(outputName) {
-        return availableOutputs.some(output => output.name === outputName);
+        return output(outputName) !== null;
+    }
+
+    function displayLabel(outputName) {
+        const match = output(outputName);
+        return match ? match.label : outputName;
+    }
+
+    function outputDetail(candidate) {
+        const size = tr("%1 × %2").arg(candidate.width).arg(candidate.height);
+        const hertz = Math.round(candidate.refresh / 1000);
+        return hertz > 0 ? tr("%1 · %2 Hz").arg(size).arg(hertz) : size;
+    }
+
+    function routeRows() {
+        return availableOutputs.map(candidate => {
+            const inUse = destinationInUse(candidate.name);
+            return {
+                "name": candidate.name,
+                "label": candidate.label,
+                "width": candidate.width,
+                "height": candidate.height,
+                "inUse": inUse,
+                "detail": inUse ? tr("Showing a mirror") : outputDetail(candidate)
+            };
+        });
+    }
+
+    function scalingSummary(source, destination) {
+        if (!source || !destination)
+            return "";
+        switch (Geometry.edgeFit(source.width, source.height, destination.width, destination.height, scaling)) {
+        case "barsSides":
+            return tr("Black bars left and right");
+        case "barsEnds":
+            return tr("Black bars above and below");
+        case "barsAll":
+            return tr("Black bars on every side");
+        case "cropSides":
+            return tr("Crops the left and right edges");
+        case "cropEnds":
+            return tr("Crops the top and bottom edges");
+        default:
+            return tr("Fills the display");
+        }
+    }
+
+    function setScaling(mode) {
+        if (pluginService)
+            pluginService.savePluginData(pluginId, "scaling", mode);
     }
 
     function destinationInUse(outputName) {
@@ -112,9 +179,13 @@ PluginComponent {
             request("stop", "", "", routeId);
     }
 
+    function routeName(sourceName, destinationName) {
+        return displayLabel(sourceName) + " → " + displayLabel(destinationName);
+    }
+
     function secondaryText() {
         if (activeMirrors.length === 1)
-            return activeMirrors[0].source + " → " + activeMirrors[0].destination;
+            return routeName(activeMirrors[0].source, activeMirrors[0].destination);
         if (activeMirrors.length > 1)
             return tr("%1 active mirrors").arg(activeMirrors.length);
         if (mirrorStatus === "error")
@@ -133,7 +204,7 @@ PluginComponent {
     ccWidgetSecondaryText: secondaryText()
     ccWidgetIsActive: isMirroring
     ccWidgetIsToggle: true
-    ccDetailHeight: 440
+    ccDetailHeight: CcMetrics.emptyStateMinHeight
 
     onCcWidgetToggled: {
         if (isMirroring) {
@@ -145,7 +216,7 @@ PluginComponent {
         const destinationName = preferredDestination(sourceName);
         if (!sourceName || !destinationName) {
             request("refresh");
-            ToastService.showError(tr("Screen Mirroring"), tr("Connect a second display, then choose a route."));
+            ToastService.showError(tr("Screen Mirroring"), tr("Connect a second display"));
             return;
         }
         startMirror(sourceName, destinationName);
@@ -154,444 +225,249 @@ PluginComponent {
     onCcWidgetExpanded: request("refreshIfStale")
 
     ccDetailContent: Component {
-        StyledRect {
+        Item {
             id: detailRoot
 
-            readonly property var outputs: root.availableOutputs
-            readonly property var outputNames: outputs.map(output => output.name)
-            readonly property var sourceNames: outputNames.filter(name => !root.destinationInUse(name))
-            readonly property var destinationNames: outputNames.filter(name => name !== selectedSource && !root.destinationInUse(name))
-            readonly property bool loading: discoveryStateVar.value === "loading" && outputs.length === 0
+            readonly property var rows: root.routeRows()
+            readonly property int freeDisplays: rows.filter(row => !row.inUse).length
+            readonly property bool canRoute: freeDisplays >= 2
+            readonly property bool loading: discoveryStateVar.value === "loading" && rows.length === 0
             readonly property bool failed: discoveryStateVar.value === "error"
+            readonly property var sourceOutput: root.output(selectedSource)
+            readonly property var destinationOutput: root.output(selectedDestination)
+            readonly property bool canRetry: !!root.failedRoute
+                && root.hasOutput(root.failedRoute.source)
+                && root.hasOutput(root.failedRoute.destination)
+                && !root.destinationInUse(root.failedRoute.destination)
             property string selectedSource: ""
             property string selectedDestination: ""
 
-            anchors.fill: parent
-            color: Theme.surfaceContainerHigh
-            radius: Theme.cornerRadius
-            clip: true
+            function selectable(name) {
+                return rows.some(row => row.name === name && !row.inUse);
+            }
 
             function ensureSelections() {
-                if (outputs.length < 2) {
+                // reads rows directly: canRoute may not have re-evaluated yet when rows changes
+                if (rows.filter(row => !row.inUse).length < 2) {
                     selectedSource = "";
                     selectedDestination = "";
                     return;
                 }
-
-                if (sourceNames.indexOf(selectedSource) < 0)
+                if (!selectable(selectedSource))
                     selectedSource = root.preferredSource();
-                if (destinationNames.indexOf(selectedDestination) < 0)
+                if (!selectable(selectedDestination) || selectedDestination === selectedSource)
                     selectedDestination = root.preferredDestination(selectedSource);
             }
 
-            onOutputsChanged: ensureSelections()
-            onSourceNamesChanged: ensureSelections()
-            onDestinationNamesChanged: {
-                if (destinationNames.indexOf(selectedDestination) < 0)
-                    selectedDestination = root.preferredDestination(selectedSource);
+            function pickSource(name) {
+                if (name === selectedDestination)
+                    selectedDestination = selectedSource;
+                selectedSource = name;
             }
+
+            function pickDestination(name) {
+                if (name === selectedSource)
+                    selectedSource = selectedDestination;
+                selectedDestination = name;
+            }
+
+            onRowsChanged: ensureSelections()
             Component.onCompleted: ensureSelections()
 
-            Column {
-                id: header
-
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.margins: Theme.spacingM
-                spacing: Theme.spacingXXS
-
-                Row {
-                    width: parent.width
-                    height: Theme.iconSizeLarge
-                    spacing: Theme.spacingS
-
-                    DankIcon {
-                        width: Theme.iconSizeLarge
-                        anchors.verticalCenter: parent.verticalCenter
-                        name: "screen_share"
-                        size: Theme.iconSize
-                        color: root.isMirroring ? Theme.primary : Theme.surfaceText
-                    }
-
-                    Column {
-                        width: parent.width - Theme.iconSizeLarge - refreshButton.width
-                            - parent.spacing * 2
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: Theme.spacingXXS
-
-                        StyledText {
-                            width: parent.width
-                            text: root.tr("Screen Mirroring")
-                            color: Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeLarge
-                            font.weight: Font.Medium
-                            wrapMode: Text.NoWrap
-                            elide: Text.ElideRight
-                        }
-
-                        StyledText {
-                            width: parent.width
-                            text: root.secondaryText()
-                            color: Theme.surfaceVariantText
-                            font.pixelSize: Theme.fontSizeSmall
-                            wrapMode: Text.NoWrap
-                            elide: Text.ElideRight
-                        }
-                    }
-
-                    DankActionButton {
-                        id: refreshButton
-                        anchors.verticalCenter: parent.verticalCenter
-                        iconName: "refresh"
-                        tooltipText: root.tr("Refresh displays")
-                        enabled: !detailRoot.loading
-                        onClicked: root.request("refresh")
-                    }
-                }
+            Binding {
+                target: root
+                property: "ccDetailHeight"
+                value: Math.ceil(detailColumn.implicitHeight)
             }
 
-            Column {
-                id: content
-
-                anchors.top: header.bottom
-                anchors.topMargin: Theme.spacingM
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: addButton.top
-                anchors.bottomMargin: Theme.spacingS
-                anchors.leftMargin: Theme.spacingM
-                anchors.rightMargin: Theme.spacingM
-                spacing: Theme.spacingS
-                visible: !detailRoot.loading && !detailRoot.failed && detailRoot.outputs.length >= 2
-
-                Row {
-                    id: routePicker
-                    width: parent.width
-                    height: Theme.iconSizeLarge * 3 + Theme.spacingXL
-                    spacing: Theme.spacingS
-
-                    Column {
-                        width: (parent.width - arrow.width - parent.spacing * 2) / 2
-                        height: parent.height
-                        spacing: Theme.spacingXS
-
-                        StyledText {
-                            width: parent.width
-                            text: root.tr("From")
-                            color: Theme.surfaceVariantText
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
-                            horizontalAlignment: Text.AlignHCenter
-                        }
-
-                        DankListView {
-                            id: sourceList
-                            width: parent.width
-                            height: parent.height - Theme.fontSizeSmall - parent.spacing
-                            spacing: Theme.spacingXS
-                            clip: true
-                            model: detailRoot.sourceNames
-
-                            delegate: StyledRect {
-                                id: sourceRow
-                                required property string modelData
-
-                                width: sourceList.width
-                                height: Theme.iconSizeLarge + Theme.spacingL
-                                radius: Theme.cornerRadius
-                                color: modelData === detailRoot.selectedSource || sourceMouse.containsMouse
-                                    ? Theme.surfaceContainerHighest
-                                    : Theme.surfaceContainer
-                                border.width: modelData === detailRoot.selectedSource || sourceMouse.activeFocus
-                                    ? 2
-                                    : Theme.layerOutlineWidth
-                                border.color: modelData === detailRoot.selectedSource
-                                    ? Theme.primary
-                                    : (sourceMouse.activeFocus ? Theme.surfaceText : Theme.outlineMedium)
-
-                                DankIcon {
-                                    anchors.left: parent.left
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    anchors.leftMargin: Theme.spacingS
-                                    name: "desktop_windows"
-                                    size: Theme.iconSize
-                                    color: modelData === detailRoot.selectedSource
-                                        ? Theme.primary
-                                        : Theme.surfaceVariantText
-                                }
-
-                                StyledText {
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: Theme.iconSize + Theme.spacingL
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Theme.spacingS
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: modelData
-                                    color: Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    font.weight: Font.Medium
-                                    wrapMode: Text.NoWrap
-                                    elide: Text.ElideRight
-                                }
-
-                                MouseArea {
-                                    id: sourceMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    activeFocusOnTab: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    Accessible.role: Accessible.RadioButton
-                                    Accessible.name: root.tr("Mirror from %1").arg(modelData)
-                                    Accessible.checked: modelData === detailRoot.selectedSource
-                                    Keys.onPressed: event => {
-                                        if (event.key === Qt.Key_Space || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                            detailRoot.selectedSource = modelData;
-                                            detailRoot.ensureSelections();
-                                            event.accepted = true;
-                                        }
-                                    }
-                                    onClicked: {
-                                        detailRoot.selectedSource = modelData;
-                                        detailRoot.ensureSelections();
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Item {
-                        id: arrow
-                        width: Theme.iconSizeLarge
-                        height: parent.height
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: "arrow_forward"
-                            size: Theme.iconSize
-                            color: Theme.primary
-                        }
-                    }
-
-                    Column {
-                        width: (parent.width - arrow.width - parent.spacing * 2) / 2
-                        height: parent.height
-                        spacing: Theme.spacingXS
-
-                        StyledText {
-                            width: parent.width
-                            text: root.tr("To")
-                            color: Theme.surfaceVariantText
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
-                            horizontalAlignment: Text.AlignHCenter
-                        }
-
-                        DankListView {
-                            id: destinationList
-                            width: parent.width
-                            height: parent.height - Theme.fontSizeSmall - parent.spacing
-                            spacing: Theme.spacingXS
-                            clip: true
-                            model: detailRoot.destinationNames
-
-                            delegate: StyledRect {
-                                id: destinationRow
-                                required property string modelData
-
-                                width: destinationList.width
-                                height: Theme.iconSizeLarge + Theme.spacingL
-                                radius: Theme.cornerRadius
-                                color: modelData === detailRoot.selectedDestination || destinationMouse.containsMouse
-                                    ? Theme.surfaceContainerHighest
-                                    : Theme.surfaceContainer
-                                border.width: modelData === detailRoot.selectedDestination || destinationMouse.activeFocus
-                                    ? 2
-                                    : Theme.layerOutlineWidth
-                                border.color: modelData === detailRoot.selectedDestination
-                                    ? Theme.primary
-                                    : (destinationMouse.activeFocus ? Theme.surfaceText : Theme.outlineMedium)
-
-                                DankIcon {
-                                    anchors.left: parent.left
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    anchors.leftMargin: Theme.spacingS
-                                    name: "tv"
-                                    size: Theme.iconSize
-                                    color: modelData === detailRoot.selectedDestination
-                                        ? Theme.primary
-                                        : Theme.surfaceVariantText
-                                }
-
-                                StyledText {
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: Theme.iconSize + Theme.spacingL
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Theme.spacingS
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: modelData
-                                    color: Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    font.weight: Font.Medium
-                                    wrapMode: Text.NoWrap
-                                    elide: Text.ElideRight
-                                }
-
-                                MouseArea {
-                                    id: destinationMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    activeFocusOnTab: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    Accessible.role: Accessible.RadioButton
-                                    Accessible.name: root.tr("Mirror to %1").arg(modelData)
-                                    Accessible.checked: modelData === detailRoot.selectedDestination
-                                    Keys.onPressed: event => {
-                                        if (event.key === Qt.Key_Space || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                            detailRoot.selectedDestination = modelData;
-                                            event.accepted = true;
-                                        }
-                                    }
-                                    onClicked: detailRoot.selectedDestination = modelData
-                                }
-                            }
-                        }
-                    }
-                }
-
-                StyledText {
-                    width: parent.width
-                    text: root.tr("Active mirrors")
-                    color: Theme.surfaceVariantText
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Medium
-                    visible: root.activeMirrors.length > 0
-                }
-
-                DankListView {
-                    id: activeList
-                    width: parent.width
-                    height: Math.max(0, content.height - routePicker.height
-                        - (root.activeMirrors.length > 0 ? Theme.fontSizeSmall + content.spacing * 2 : content.spacing))
-                    spacing: Theme.spacingXS
-                    clip: true
-                    visible: root.activeMirrors.length > 0
-                    model: root.activeMirrors
-
-                    delegate: StyledRect {
-                        required property var modelData
-
-                        width: activeList.width
-                        height: Theme.iconSizeLarge + Theme.spacingS
-                        radius: Theme.cornerRadius
-                        color: Theme.surfaceContainerHighest
-
-                        Row {
-                            anchors.fill: parent
-                            anchors.leftMargin: Theme.spacingM
-                            anchors.rightMargin: Theme.spacingXS
-                            spacing: Theme.spacingS
-
-                            DankIcon {
-                                name: "screen_share"
-                                size: Theme.iconSizeSmall
-                                color: Theme.primary
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-
-                            StyledText {
-                                width: parent.width - Theme.iconSizeSmall - stopButton.width - parent.spacing * 2
-                                text: modelData.source + " → " + modelData.destination
-                                color: Theme.surfaceText
-                                font.pixelSize: Theme.fontSizeMedium
-                                font.weight: Font.Medium
-                                wrapMode: Text.NoWrap
-                                elide: Text.ElideRight
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-
-                            DankActionButton {
-                                id: stopButton
-                                anchors.verticalCenter: parent.verticalCenter
-                                iconName: modelData.status === "stopping" ? "hourglass_top" : "close"
-                                tooltipText: root.tr("Stop this mirror")
-                                enabled: modelData.status !== "stopping"
-                                onClicked: root.stopMirror(modelData.id)
-                            }
-                        }
-                    }
-                }
-
-                StyledText {
-                    width: parent.width
-                    height: Math.max(0, content.height - routePicker.height - content.spacing)
-                    visible: root.activeMirrors.length === 0
-                    text: root.tr("No active mirrors")
-                    color: Theme.surfaceVariantText
-                    font.pixelSize: Theme.fontSizeSmall
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-
-            Item {
-                anchors.top: header.bottom
-                anchors.topMargin: Theme.spacingS
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: addButton.top
-                visible: !content.visible
-
-                DankSpinner {
-                    anchors.centerIn: parent
-                    visible: detailRoot.loading
-                    running: visible
-                    size: Theme.iconSizeLarge
-                    color: Theme.primary
-                }
+            DFlickable {
+                anchors.fill: parent
+                contentHeight: detailColumn.height
+                clip: true
 
                 Column {
-                    width: parent.width - Theme.spacingXL * 2
-                    anchors.centerIn: parent
-                    spacing: Theme.spacingS
-                    visible: !detailRoot.loading
+                    id: detailColumn
 
-                    DankIcon {
-                        name: detailRoot.failed ? "error_outline" : "desktop_access_disabled"
-                        size: Theme.iconSizeLarge
-                        color: detailRoot.failed ? Theme.error : Theme.surfaceVariantText
-                        anchors.horizontalCenter: parent.horizontalCenter
+                    width: parent.width
+                    spacing: CcMetrics.detailContentGap
+
+                    CcEmptyState {
+                        visible: detailRoot.failed || (!detailRoot.canRoute && !root.isMirroring)
+                        spinning: detailRoot.loading
+                        iconName: detailRoot.failed ? "error" : "desktop_access_disabled"
+                        iconColor: detailRoot.failed ? Theme.error : Theme.surfaceVariantText
+                        title: {
+                            if (detailRoot.loading)
+                                return root.tr("Finding displays…");
+                            if (detailRoot.failed)
+                                return lastErrorVar.value || root.tr("Displays could not be loaded");
+                            return root.tr("Connect a second display");
+                        }
+                        subtitle: detailRoot.loading || detailRoot.failed ? "" : root.tr("It appears here when connected")
+
+                        DButton {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            visible: detailRoot.failed
+                            buttonHeight: Theme.buttonHeightXS
+                            iconName: "refresh"
+                            iconSize: Theme.iconSizeSmall
+                            text: root.tr("Try again")
+                            backgroundColor: Theme.chipSurface
+                            textColor: Theme.surfaceText
+                            onClicked: root.request("refresh")
+                        }
                     }
 
-                    StyledText {
+                    CcGroup {
+                        visible: !!root.failedRoute
+
+                        CcListRow {
+                            iconName: "error"
+                            iconColor: Theme.error
+                            title: root.tr("Mirror stopped unexpectedly")
+                            subtitle: root.failedRoute ? root.routeName(root.failedRoute.source, root.failedRoute.destination) : ""
+
+                            DButton {
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: detailRoot.canRetry
+                                buttonHeight: Theme.buttonHeightXS
+                                minimumWidth: 0
+                                text: root.tr("Try again")
+                                backgroundColor: Theme.chipSurface
+                                textColor: Theme.surfaceText
+                                onClicked: root.startMirror(root.failedRoute.source, root.failedRoute.destination)
+                            }
+
+                            DActionButton {
+                                anchors.verticalCenter: parent.verticalCenter
+                                iconName: "close"
+                                tooltipText: root.tr("Dismiss")
+                                onClicked: root.request("dismissFailure")
+                            }
+                        }
+                    }
+
+                    Column {
                         width: parent.width
-                        text: detailRoot.failed
-                            ? (lastErrorVar.value || root.tr("Displays could not be loaded."))
-                            : root.tr("Connect a second display to create a mirror route")
-                        color: Theme.surfaceVariantText
-                        font.pixelSize: Theme.fontSizeMedium
-                        horizontalAlignment: Text.AlignHCenter
-                        wrapMode: Text.WordWrap
+                        visible: root.isMirroring
+
+                        CcSectionLabel {
+                            text: root.tr("Mirroring")
+
+                            actions: DButton {
+                                visible: root.activeMirrors.length > 1
+                                buttonHeight: Theme.buttonHeightXS
+                                minimumWidth: 0
+                                text: root.tr("Stop all")
+                                backgroundColor: Theme.chipSurface
+                                textColor: Theme.surfaceText
+                                onClicked: root.request("stopAll")
+                            }
+                        }
+
+                        CcGroup {
+                            Repeater {
+                                model: root.activeMirrors
+
+                                CcListRow {
+                                    id: routeRow
+
+                                    required property var modelData
+                                    readonly property bool stopping: modelData.status === "stopping"
+                                    readonly property var sourceOutput: root.output(modelData.source)
+                                    readonly property var destinationOutput: root.output(modelData.destination)
+
+                                    title: root.displayLabel(modelData.destination)
+                                    subtitle: stopping ? root.tr("Stopping…") : root.tr("Showing %1").arg(root.displayLabel(modelData.source))
+
+                                    leading: DisplayShape {
+                                        displayWidth: routeRow.destinationOutput?.width ?? 0
+                                        displayHeight: routeRow.destinationOutput?.height ?? 0
+                                        sourceWidth: routeRow.sourceOutput?.width ?? 0
+                                        sourceHeight: routeRow.sourceOutput?.height ?? 0
+                                        scaling: routeRow.modelData.scaling || "fit"
+                                        outlineWidth: Theme.outlineWidth
+                                        color: Theme.primary
+                                    }
+
+                                    DActionButton {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        iconName: "stop_screen_share"
+                                        iconColor: Theme.surfaceText
+                                        tooltipText: root.tr("Stop this mirror")
+                                        enabled: !routeRow.stopping
+                                        onClicked: root.stopMirror(routeRow.modelData.id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width
+                        spacing: CcMetrics.detailContentGap
+                        visible: detailRoot.canRoute
+
+                        DisplayColumn {
+                            width: (parent.width - parent.spacing) / 2
+                            title: root.tr("From")
+                            rows: detailRoot.rows
+                            selectedName: detailRoot.selectedSource
+                            onPicked: name => detailRoot.pickSource(name)
+                        }
+
+                        DisplayColumn {
+                            width: (parent.width - parent.spacing) / 2
+                            title: root.tr("To")
+                            rows: detailRoot.rows
+                            selectedName: detailRoot.selectedDestination
+                            onPicked: name => detailRoot.pickDestination(name)
+                        }
+                    }
+
+                    CcGroup {
+                        visible: detailRoot.canRoute
+
+                        CcListRow {
+                            title: root.tr("Scaling")
+                            subtitle: root.scalingSummary(detailRoot.sourceOutput, detailRoot.destinationOutput)
+
+                            leading: DisplayShape {
+                                implicitWidth: Theme.iconSizeLarge * 2
+                                implicitHeight: Theme.iconSizeLarge + Theme.spacingS
+                                outlineWidth: Theme.outlineWidth
+                                displayWidth: detailRoot.destinationOutput?.width ?? 0
+                                displayHeight: detailRoot.destinationOutput?.height ?? 0
+                                sourceWidth: detailRoot.sourceOutput?.width ?? 0
+                                sourceHeight: detailRoot.sourceOutput?.height ?? 0
+                                scaling: root.scaling
+                                color: Theme.primary
+                            }
+
+                            DButtonGroup {
+                                anchors.verticalCenter: parent.verticalCenter
+                                size: "small"
+                                checkEnabled: false
+                                model: [root.tr("Fit"), root.tr("Fill"), root.tr("Integer")]
+                                currentIndex: root.scalingModes.indexOf(root.scaling)
+                                onSelectionChanged: (index, selected) => {
+                                    if (selected)
+                                        root.setScaling(root.scalingModes[index]);
+                                }
+                            }
+                        }
+                    }
+
+                    DButton {
+                        width: parent.width
+                        maximumWidth: parent.width
+                        visible: detailRoot.canRoute
+                        enabled: !!detailRoot.sourceOutput && !!detailRoot.destinationOutput
+                        iconName: "screen_share"
+                        text: root.tr("Mirror to %1").arg(root.displayLabel(detailRoot.selectedDestination))
+                        onClicked: root.startMirror(detailRoot.selectedSource, detailRoot.selectedDestination)
                     }
                 }
-            }
-
-            DankButton {
-                id: addButton
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.margins: Theme.spacingM
-                visible: content.visible
-                enabled: detailRoot.selectedSource.length > 0
-                    && detailRoot.selectedDestination.length > 0
-                    && detailRoot.selectedSource !== detailRoot.selectedDestination
-                    && !root.destinationInUse(detailRoot.selectedDestination)
-                text: root.tr("Add Mirror")
-                iconName: "add_to_queue"
-                backgroundColor: Theme.buttonBg
-                textColor: Theme.buttonText
-                onClicked: root.startMirror(detailRoot.selectedSource, detailRoot.selectedDestination)
             }
         }
     }

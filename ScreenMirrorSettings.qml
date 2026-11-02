@@ -17,7 +17,7 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: I18n.trFor("dankDisplayMirror", "Choose how new wl-mirror windows are created.")
+        text: I18n.trFor("dankDisplayMirror", "Applies to new mirrors.")
         color: Theme.surfaceVariantText
         font.pixelSize: Theme.fontSizeSmall
         wrapMode: Text.WordWrap
@@ -44,7 +44,7 @@ PluginSettings {
                 "value": "cover"
             },
             {
-                "label": I18n.trFor("dankDisplayMirror", "Integer scale"),
+                "label": I18n.trFor("dankDisplayMirror", "Integer"),
                 "value": "exact"
             }
         ]

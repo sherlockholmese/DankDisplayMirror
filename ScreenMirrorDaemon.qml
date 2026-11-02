@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import qs.Common
 import qs.Services
@@ -12,15 +13,18 @@ PluginComponent {
     property var mirrorProcesses: ({})
     property var outputCache: []
     property bool refreshInFlight: false
+    property bool refreshQueued: false
     property double lastRefreshAt: 0
     readonly property int refreshMaxAgeMs: 5000
     readonly property int stderrLimit: 4096
+    readonly property int hotplugSettleMs: 750
 
     PluginGlobalVar {
         id: requestVar
         varName: "request"
         defaultValue: null
-        onValueChanged: root.handleRequest(value)
+        // deferred: handling a request publishes, which would re-enter this binding
+        onValueChanged: Qt.callLater(root.handleRequest, value)
     }
 
     function publish(name, value) {
@@ -44,13 +48,50 @@ PluginComponent {
             stopAllMirrors();
             return;
         }
+        if (request.action === "dismissFailure") {
+            publish("failedRoute", null);
+            publishMirrors();
+            return;
+        }
         if (request.action === "start" && request.source && request.destination)
             startMirror(String(request.source), String(request.destination));
     }
 
+    function displayOutput(output, screen) {
+        const width = Number(output.width || 0);
+        const height = Number(output.height || 0);
+        // dms randr reports the unrotated mode, the screen reports what is on the panel
+        const rotated = screen && screen.width > 0 && (screen.width > screen.height) !== (width > height);
+        return {
+            "name": String(output.name || ""),
+            "label": displayLabel(String(output.name || ""), screen),
+            "width": rotated ? height : width,
+            "height": rotated ? width : height,
+            "scale": Number(output.scale || 1),
+            "refresh": Number(output.refresh || 0)
+        };
+    }
+
+    function displayLabel(outputName, screen) {
+        if (/^(eDP|LVDS|DSI)-/.test(outputName))
+            return I18n.trFor("dankDisplayMirror", "Built-in display");
+        return (screen && screen.model) || outputName;
+    }
+
+    function withDistinctLabels(outputs) {
+        return outputs.map(output => {
+            const shared = outputs.some(other => other !== output && other.label === output.label);
+            return Object.assign({}, output, {
+                "label": shared ? output.label + " (" + output.name + ")" : output.label
+            });
+        });
+    }
+
     function refreshOutputs(force) {
-        if (refreshInFlight)
+        if (refreshInFlight) {
+            refreshQueued = refreshQueued || force;
             return;
+        }
         if (!force && outputCache.length > 0 && Date.now() - lastRefreshAt < refreshMaxAgeMs)
             return;
 
@@ -59,23 +100,29 @@ PluginComponent {
             publish("discoveryState", "loading");
         Proc.runCommand("dankDisplayMirror.outputs", ["dms", "randr", "--json"], (stdout, exitCode) => {
             refreshInFlight = false;
+            if (refreshQueued) {
+                refreshQueued = false;
+                Qt.callLater(root.refreshOutputs, true);
+            }
             if (exitCode !== 0) {
                 outputCache = [];
                 publish("outputs", []);
                 publish("discoveryState", "error");
-                publish("lastError", I18n.trFor("dankDisplayMirror", "Displays could not be loaded. Try refreshing."));
+                publish("lastError", I18n.trFor("dankDisplayMirror", "Displays could not be loaded"));
                 return;
             }
 
             try {
                 const payload = JSON.parse(stdout || "{}");
-                const available = (payload.outputs || []).filter(output => output.enabled).map(output => ({
-                    "name": String(output.name || ""),
-                    "width": Number(output.width || 0),
-                    "height": Number(output.height || 0),
-                    "scale": Number(output.scale || 1),
-                    "refresh": Number(output.refresh || 0)
-                })).filter(output => output.name.length > 0);
+                const screens = Quickshell.screens;
+                const available = withDistinctLabels((payload.outputs || []).filter(output => output.enabled).map(output => {
+                    let screen = null;
+                    for (let i = 0; i < screens.length; i++) {
+                        if (screens[i].name === output.name)
+                            screen = screens[i];
+                    }
+                    return displayOutput(output, screen);
+                }).filter(output => output.name.length > 0));
 
                 if (JSON.stringify(available) !== JSON.stringify(outputCache)) {
                     outputCache = available;
@@ -88,24 +135,28 @@ PluginComponent {
                 outputCache = [];
                 publish("outputs", []);
                 publish("discoveryState", "error");
-                publish("lastError", I18n.trFor("dankDisplayMirror", "The display list was not understood. Try refreshing."));
+                publish("lastError", I18n.trFor("dankDisplayMirror", "The display list could not be read"));
             }
         }, 0, 5000, root);
     }
 
-    function mirrorCommand(sourceName, destinationName) {
-        const showCursor = pluginService
-            ? pluginService.loadPluginData(pluginId, "showCursor", true)
-            : true;
+    function scalingMode() {
         const scaling = pluginService
             ? pluginService.loadPluginData(pluginId, "scaling", "fit")
             : "fit";
+        return ["fit", "cover", "exact"].indexOf(scaling) >= 0 ? scaling : "fit";
+    }
+
+    function mirrorCommand(sourceName, destinationName, scaling) {
+        const showCursor = pluginService
+            ? pluginService.loadPluginData(pluginId, "showCursor", true)
+            : true;
 
         return [
             "wl-mirror",
             showCursor ? "--show-cursor" : "--no-show-cursor",
             "--scaling",
-            ["fit", "cover", "exact"].indexOf(scaling) >= 0 ? scaling : "fit",
+            scaling,
             "--fullscreen-output",
             destinationName,
             "--title",
@@ -120,7 +171,8 @@ PluginComponent {
 
     function publishMirrors() {
         publish("activeMirrors", activeMirrors);
-        publish("status", activeMirrors.length > 0 ? "active" : "idle");
+        const failed = pluginService ? pluginService.getGlobalVar(pluginId, "failedRoute", null) : null;
+        publish("status", activeMirrors.length > 0 ? "active" : (failed ? "error" : "idle"));
     }
 
     function destinationInUse(destinationName) {
@@ -135,11 +187,12 @@ PluginComponent {
         if (mirrorProcesses[id] || destinationInUse(destinationName))
             return;
 
+        const scaling = scalingMode();
         const process = mirrorProcessComponent.createObject(root, {
             "routeId": id,
             "sourceName": sourceName,
             "destinationName": destinationName,
-            "command": mirrorCommand(sourceName, destinationName)
+            "command": mirrorCommand(sourceName, destinationName, scaling)
         });
         if (!process)
             return;
@@ -151,9 +204,10 @@ PluginComponent {
             "id": id,
             "source": sourceName,
             "destination": destinationName,
+            "scaling": scaling,
             "status": "active"
         }]);
-        publish("lastError", "");
+        publish("failedRoute", null);
         publishMirrors();
         process.running = true;
     }
@@ -164,12 +218,9 @@ PluginComponent {
             if (route.id !== id || route.status === status)
                 return route;
             changed = true;
-            return {
-                "id": route.id,
-                "source": route.source,
-                "destination": route.destination,
+            return Object.assign({}, route, {
                 "status": status
-            };
+            });
         });
         if (!changed)
             return;
@@ -203,11 +254,13 @@ PluginComponent {
         if (!requested && exitCode !== 0) {
             if (stderrText)
                 console.warn("dankDisplayMirror: wl-mirror failed:", stderrText.trim());
-            publish("lastError", routeName
-                ? I18n.trFor("dankDisplayMirror", "Mirror %1 stopped unexpectedly.").arg(routeName)
-                : I18n.trFor("dankDisplayMirror", "A screen mirror stopped unexpectedly."));
-            publish("activeMirrors", activeMirrors);
-            publish("status", activeMirrors.length > 0 ? "active" : "error");
+            if (route) {
+                publish("failedRoute", {
+                    "source": route.source,
+                    "destination": route.destination
+                });
+            }
+            publishMirrors();
             ToastService.showError(
                 I18n.trFor("dankDisplayMirror", "Mirror stopped unexpectedly"),
                 routeName
@@ -221,6 +274,20 @@ PluginComponent {
             );
         }
         publishMirrors();
+    }
+
+    Timer {
+        id: hotplugRefresh
+        interval: root.hotplugSettleMs
+        onTriggered: root.refreshOutputs(true)
+    }
+
+    Connections {
+        target: Quickshell
+
+        function onScreensChanged() {
+            hotplugRefresh.restart();
+        }
     }
 
     Component {
@@ -263,6 +330,7 @@ PluginComponent {
     Component.onCompleted: {
         publish("status", "idle");
         publish("activeMirrors", []);
+        publish("failedRoute", null);
         publish("lastError", "");
         refreshOutputs(true);
     }
